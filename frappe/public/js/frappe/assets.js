@@ -9,12 +9,53 @@ frappe.require = function (items, callback) {
 	if (typeof items === "string") {
 		items = [items];
 	}
-	items = items.map((item) => frappe.assets.bundled_asset(item));
 
-	return new Promise((resolve) => {
-		frappe.assets.execute(items, () => {
-			resolve();
-			callback && callback();
+	const requested_items = items;
+	const refresh_asset_map = () => {
+		const assets_json = frappe.boot?.assets_json || {};
+		const has_unresolved_bundle = requested_items.some(
+			(item) => {
+				const logical_item = item.startsWith("/") ? item.slice(1) : item;
+				return (
+					item.includes(".bundle.") &&
+					!item.startsWith("/assets") &&
+					!assets_json[logical_item]
+				);
+			}
+		);
+
+		if (!has_unresolved_bundle || typeof frappe.call !== "function") {
+			return Promise.resolve();
+		}
+
+		// A stale shared assets_json cache can make a valid v16 bundle look like
+		// a root-relative file. Share one refresh across concurrent require calls.
+		frappe._assets_json_refresh ||= frappe
+			.call("frappe.sessions.get_boot_assets_json")
+			.then((response) => {
+				if (response?.message && typeof response.message === "object") {
+					frappe.boot.assets_json = {
+						...(frappe.boot.assets_json || {}),
+						...response.message,
+					};
+				}
+			})
+			.catch(() => {})
+			.finally(() => {
+				frappe._assets_json_refresh = null;
+			});
+
+		return frappe._assets_json_refresh;
+	};
+
+	return refresh_asset_map().then(() => {
+		items = requested_items.map((item) => frappe.assets.bundled_asset(item));
+
+		return new Promise((resolve) => {
+			frappe.assets.execute(items, () => {
+				resolve();
+				callback && callback();
+			});
 		});
 	});
 };
@@ -147,7 +188,8 @@ class AssetManager {
 			if (path.endsWith(".css") && is_rtl) {
 				path = `rtl_${path}`;
 			}
-			path = frappe.boot.assets_json[path] || path;
+			const logical_path = path.startsWith("/") ? path.slice(1) : path;
+			path = frappe.boot?.assets_json?.[logical_path] || path;
 			return path;
 		}
 		return path;
