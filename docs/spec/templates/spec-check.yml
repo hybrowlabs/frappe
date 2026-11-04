@@ -1,0 +1,122 @@
+# Reusable spec-check workflow template (copy-in). Documentation: docs/spec/ci-spec-check.md
+#
+# Copy to <repo>/.github/workflows/spec-check.yml ONLY when the repo adopts the gate (Stage 6 of
+# PWHR-1270). This file lives under docs/spec/templates/ so GitHub does not run it here.
+# Edit only the "env" block and the push branch below. Do not edit the steps for one repo.
+#
+# What it does: runs the spec checkers on a clean checkout. The checkers read files only
+# (Python standard library: no Frappe, no bench, no database, no network). They do not run tests,
+# so a green run is not a test pass and not coverage (docs/spec/acceptance-cases.md section 8).
+#
+# Contract with the checkers (docs/spec/ci-spec-check.md section 3):
+#   python <checker> --root <repo root>   exit 0 = no problem; exit 1 = spec problems, one per line
+#   on stdout; any other exit code = the checker itself failed. Any non-zero exit fails the job.
+name: Spec check
+
+on:
+  pull_request:
+  push:
+    branches: [main] # change to the repo's default branch
+  workflow_dispatch:
+
+# Read-only token, no secrets used anywhere in this workflow.
+permissions:
+  contents: read
+
+concurrency:
+  group: spec-check-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Directory that holds docs/spec/, relative to the repo root.
+  SPEC_ROOT: "."
+  # Space-separated checker scripts, relative to the repo root. Run in this order; all are run
+  # even if an earlier one fails, so one run reports every problem.
+  SPEC_CHECKERS: "tools/check_spec_cases.py tools/check_spec_test_links.py"
+  # The checkers are standard-library only. Keep this at or below the lowest Python the repo supports.
+  SPEC_PYTHON_VERSION: "3.10"
+
+jobs:
+  spec-check:
+    # Keep this job name stable: branch protection (Stage 6) will require the check "Spec check".
+    name: Spec check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.SPEC_PYTHON_VERSION }}
+
+      - name: Run spec checkers
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          report="$(mktemp)"
+          details="$(mktemp)"
+          {
+            echo "## Spec check"
+            echo
+            echo "| Checker | Exit | Result |"
+            echo "|---|---|---|"
+          } >> "$summary"
+
+          if [ ! -d "$SPEC_ROOT/docs/spec" ]; then
+            echo "::error::$SPEC_ROOT/docs/spec does not exist. Adopt docs/spec/ first or fix SPEC_ROOT."
+            echo "| (spec folder) | - | FAIL: missing \`$SPEC_ROOT/docs/spec\` |" >> "$summary"
+            exit 1
+          fi
+
+          for checker in $SPEC_CHECKERS; do
+            echo "::group::python $checker --root $SPEC_ROOT"
+            if [ ! -f "$checker" ]; then
+              echo "::error::checker not found: $checker"
+              echo "| \`$checker\` | - | FAIL: file not found |" >> "$summary"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+            rc=0
+            python "$checker" --root "$SPEC_ROOT" > "$report" 2>&1 || rc=$?
+            cat "$report"
+            echo "::endgroup::"
+            # An uncaught exception also exits 1; tell it apart from a problem report by its traceback.
+            crashed=0
+            if [ "$rc" -eq 1 ] && grep -q '^Traceback (most recent call last):' "$report"; then
+              crashed=1
+              rc=-1
+            fi
+            case "$rc" in
+              0)
+                echo "| \`$checker\` | 0 | pass |" >> "$summary"
+                ;;
+              1)
+                echo "::error::$checker reported spec problems (exit 1). See the log group above."
+                echo "| \`$checker\` | 1 | FAIL: spec problems |" >> "$summary"
+                { echo "### \`$checker\`"; echo; echo '```text'; head -c 20000 "$report"; echo '```'; echo; } >> "$details"
+                failed=1
+                ;;
+              *)
+                shown="$rc"
+                [ "$crashed" -eq 1 ] && shown="1 (traceback)"
+                echo "::error::$checker itself failed (exit $shown). This is not a spec problem report."
+                echo "| \`$checker\` | $shown | FAIL: checker error |" >> "$summary"
+                { echo "### \`$checker\`"; echo; echo '```text'; head -c 20000 "$report"; echo '```'; echo; } >> "$details"
+                failed=1
+                ;;
+            esac
+          done
+
+          {
+            echo
+            cat "$details"
+            echo "These checkers read files only. They do not run tests: a pass here is not a test pass and not coverage."
+          } >> "$summary"
+          exit "$failed"
